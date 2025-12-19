@@ -4,12 +4,17 @@ from dotenv import load_dotenv
 import cocoindex
 from doris_vector_search import DorisVectorClient, AuthOptions, IndexOptions
 import pandas as pd
-from sentence_transformers import SentenceTransformer
 import requests
 from requests.auth import HTTPBasicAuth
+# Using OpenRouter Embeddings API
+from cocoindex.llm import LlmApiType
+from cocoindex.auth_registry import add_transient_auth_entry
 
 # Use the Doris target defined in this repo
 from doris_target import DorisTarget
+
+# Load environment variables
+load_dotenv()
 
 # Doris connection configuration (override via environment variables)
 DORIS_FE_HOST = os.getenv("DORIS_FE_HOST", "localhost")
@@ -23,21 +28,28 @@ DORIS_PASSWORD = os.getenv("DORIS_PASSWORD", "")
 # Source directory for demo documents
 DOCS_DIR = os.getenv("DOCS_DIR", "/mnt/disk4/hezhiqiang/code/cocoindex/examples/text_embedding_qdrant/markdown_files")
 
-# Embedding model (must match at index and query time)
-EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-
+# OpenRouter embedding config (must match at index and query time)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_EMBED_MODEL = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/embeddings")
+OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 
 @cocoindex.transform_flow()
 def text_to_embedding(
     text: cocoindex.DataSlice[str],
 ) -> cocoindex.DataSlice[list[float]]:
     """
-    Shared embedding step using SentenceTransformer.
+    Shared embedding step using OpenAI Embedding API.
     """
+    # Use CocoIndex built-in EmbedText function with OpenRouter
     return text.transform(
-        cocoindex.functions.SentenceTransformerEmbed(model=EMBEDDING_MODEL)
+        cocoindex.functions.EmbedText(
+            api_type=LlmApiType.OPEN_ROUTER,
+            model=OPENROUTER_EMBED_MODEL,
+            address=OPENROUTER_API_BASE,
+            output_dimension=4096,
+            api_key=add_transient_auth_entry(OPENROUTER_API_KEY),
+        )
     )
 
 
@@ -46,7 +58,11 @@ def text_embedding_flow(
     flow_builder: cocoindex.FlowBuilder, data_scope: cocoindex.DataScope
 ) -> None:
     data_scope["documents"] = flow_builder.add_source(
-        cocoindex.sources.LocalFile(path=DOCS_DIR)
+        cocoindex.sources.LocalFile(
+            path=DOCS_DIR,
+            included_patterns=["**/*.md", "**/*.txt"],
+            excluded_patterns=["**/*.pdf", "**/*.png", "**/*.jpg", "**/*.jpeg"],
+        )
     )
 
     doc_embeddings = data_scope.add_collector()
@@ -103,13 +119,21 @@ def _open_doris_table():
     )
     return client.open_table(DORIS_TABLE)
 
-@functools.cache
-def _st_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL)
-
-
-def _embed_query_with_st(query: str) -> list[float]:
-    return _st_model().encode(query).tolist()
+def _openrouter_embed(text: str) -> list[float]:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Missing OPENROUTER_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_EMBED_MODEL,
+        "input": text,
+    }
+    resp = requests.post(OPENROUTER_BASE_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    j = resp.json()
+    return j["data"][0]["embedding"]
 
 
 @text_embedding_flow.query_handler(
@@ -120,8 +144,8 @@ def _embed_query_with_st(query: str) -> list[float]:
 )
 
 def search(query: str) -> cocoindex.QueryOutput:
-    # Compute embedding for the input query using ST to avoid PG dependency
-    query_embedding = _embed_query_with_st(query)
+    # Compute embedding for the input query using OpenRouter Embeddings
+    query_embedding = _openrouter_embed(query)
 
     # Use doris-vector-search SDK to perform vector search
     table = _open_doris_table()
